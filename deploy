@@ -1,0 +1,78 @@
+#!/bin/bash
+
+set -eo pipefail; [[ -n ${DOKKU_TRACE:-""} ]] && set -x
+source "$(dirname $0)/../common/functions"
+
+PLUGIN_DIR=$(dirname "$0")
+if [[ -f "$PLUGIN_DIR/.rc" ]]; then
+	source "$PLUGIN_DIR/.rc"
+fi
+
+APP=$1
+APP_TYPE=${APP/*./}
+
+DOMAIN_SUFFIX=${DOMAIN_SUFFIX:-".docker"}
+BACKUP_DIR=${BACKUP_DIR:-$(dirname $0)}
+MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-""}
+DOCKER_MYSQL_IMAGE=${DOCKER_MYSQL_IMAGE:-"mysql"}
+EMAIL_DOMAIN_WHITELIST=${EMAIL_DOMAIN_WHITELIST:-"example.com"}
+
+MYSQL_BACKUP_FILE="$BACKUP_DIR/$APP_TYPE.sql"
+MYSQL_DATA_CONTAINER_NAME="data.mysql.$APP"
+MYSQL_CONTAINER_NAME="mysql.$APP"
+MYSQL_HOST="$MYSQL_CONTAINER_NAME$DOMAIN_SUFFIX"
+MYSQL_CLIENT="docker run --rm -i $DOCKER_MYSQL_IMAGE mysql -u root -p$MYSQL_ROOT_PASSWORD --host $MYSQL_HOST"
+
+if [[ ! -f "$MYSQL_BACKUP_FILE" ]]; then
+	dokku_log_info1_quiet "There is no mysql backup file, I won’t start database service"
+	exit;
+fi
+
+MYSQL_DATABASE_NAME=$(head "$MYSQL_BACKUP_FILE" | awk 'NR == 3 {print $5}')
+
+(
+	if docker create --name $MYSQL_DATA_CONTAINER_NAME $DOCKER_MYSQL_IMAGE >/dev/null; then
+		dokku_log_info1 "Initializing mysql storage..."
+	fi
+
+	if docker rm $MYSQL_CONTAINER_NAME >/dev/null; then
+		dokku_log_verbose "Cleaning up old mysql instance..."
+	fi
+
+	if docker run -d \
+		-e MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD \
+		--volumes-from $MYSQL_DATA_CONTAINER_NAME \
+		--name $MYSQL_CONTAINER_NAME \
+		$DOCKER_MYSQL_IMAGE >/dev/null; then
+
+		while ! echo "DO 0" | $MYSQL_CLIENT; do
+			sleep 1 # let mysql start
+		done
+		dokku_log_info1 "Started mysql instance: $MYSQL_CONTAINER_NAME$DOMAIN_SUFFIX"
+	else
+		dokku_log_verbose "Mysql instance running at: $MYSQL_CONTAINER_NAME$DOMAIN_SUFFIX"
+	fi
+
+) 2>/dev/null
+
+if echo create database $MYSQL_DATABASE_NAME | $MYSQL_CLIENT 2>/dev/null; then
+	dokku_log_info1 "Created database $MYSQL_DATABASE_NAME"
+	if [[ -r "$MYSQL_BACKUP_FILE" ]]; then
+		dokku_log_info2 "Restoring database from file: $MYSQL_BACKUP_FILE"
+		perl -pe 's/([\w.]+@[\w.-]+)/\1.invalid/g' "$MYSQL_BACKUP_FILE" \
+			| perl -pe "s/($(IFS=\|; echo "${EMAIL_DOMAIN_WHITELIST[*]}")).invalid/\1/g" \
+			| $MYSQL_CLIENT --database $MYSQL_DATABASE_NAME 2>/dev/null
+	fi
+fi
+
+# configure application:
+
+ENV_FILE="$DOKKU_ROOT/$APP/ENV"
+if [[ ! -f "$ENV_FILE" ]] || [[ ! $(grep -q MYSQL_HOST "$ENV_FILE") ]]; then
+	cat && cat >> "$ENV_FILE" <<-EOF
+		export MYSQL_HOST=$MYSQL_HOST
+		export MYSQL_DATABASE_NAME=$MYSQL_DATABASE_NAME
+		export MYSQL_USERNAME=root
+		export MYSQL_PASSWORD=$MYSQL_ROOT_PASSWORD
+		EOF
+fi
